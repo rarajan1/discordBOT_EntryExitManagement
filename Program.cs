@@ -2,8 +2,8 @@
 using Discord.WebSocket;
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
-using System.Collections;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -16,11 +16,10 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace discordBOT_EntryExitManagement
 {
-
     class Program
     {
         public static Func<string, Task<string>> signalReceived;
-
+        
         //ホストの起動をMain関数とする
         public static void Main(string[] args) => ConfigureHostBuider(args).Build().Run();
 
@@ -35,20 +34,19 @@ namespace discordBOT_EntryExitManagement
             {
                 services.AddHostedService<ClientReceiveServer>();
                 services.AddHostedService<DiscordBotService>();
-            });
-            
+            }
+            );
+
 
         class DiscordBotService : BackgroundService
         {
 
             private DiscordSocketClient _client;
-            private SocketGuild discordServer;
             private readonly IConfiguration _configuration;
-            private string Token = " ";
-            private int memberCount = 0;
-            private int MemberCount{ get { return memberCount; } set { memberCount = value; if (memberCount < 0) memberCount = 0; } }
-            private List<string> CurentMember = new List<string>();
-            
+            private string Token = ""; //トークン
+            private TimeOutExe UpdateMember = new TimeOutExe(10);
+            private List<MemberDatas> memberDatasList = new List<MemberDatas>();
+
             public DiscordBotService(IConfiguration configuration)
             {
                 _configuration = configuration;
@@ -67,15 +65,17 @@ namespace discordBOT_EntryExitManagement
                     Console.WriteLine($"{x.Message}, {x.Exception}");
                     return Task.CompletedTask;
                 };
-                
+                //タイムアウトするとメンバーを更新する
+                UpdateMember.TimeoutedFunc += UpdateMemberDisplay;
                 //タブレットから信号を受けとった時のメソッドを登録
-                signalReceived += this.SignalReceived;
+                signalReceived += SignalRecived;
 
                 //discordにログイン
                 await _client.LoginAsync(Discord.TokenType.Bot, Token);
                 await _client.StartAsync();
                 await _client.SetStatusAsync(UserStatus.DoNotDisturb);
                 await _client.SetGameAsync($"0人が研究室", null, ActivityType.Competing);
+
             }
 
             public override async Task StopAsync(CancellationToken cancellationToken)
@@ -83,83 +83,101 @@ namespace discordBOT_EntryExitManagement
                 await _client.StopAsync();
             }
 
-            private async Task<string> SignalReceived(string data)
+            private async Task<string> SignalRecived(string data)
             {
-                if(data == "icon")
+                var s = data.Split(',');
+                if (s[1] == "icon")
+                    return await SendAvatar(ulong.Parse(s[0])); //アバターのデータを返す
+                else
                 {
-                    //var g = _client.Guilds.GetEnumerator().Current as SocketGuild;
-                    //var ds =g;
-                    //Console.WriteLine(g);
-                    //string sentData = "";
-                    //using (var fstream = new FileStream("memberIdList.txt",FileMode.Open, FileAccess.Read))
-                    //{
-                    //    var reader = new StreamReader(fstream, Encoding.UTF8);
-                    //
-                    //    while(!reader.EndOfStream)
-                    //    {
-                    //        var line = reader.ReadLine();
-                    //        var userData = await _client.GetUserAsync(ulong.Parse(line));
-                    //        sentData += $"{userData.GetAvatarUrl()},";
-                    //        sentData += $"{userData.Username},";
-                    //    }
-                    //}
-                    //return $"{sentData}";
-                    
-                    string sentData = "";
-                    int i=0;
-                    using (var fstream = new FileStream("memberNameList.txt", FileMode.Open, FileAccess.Read))
+                    UpdateMembers(data);//メンバーの情報を追加する
+                    return "ok";
+                }
+            }
+            private async Task<string> SendAvatar(ulong sendedGuildId)
+            {
+                string sentData = "";
+                //BOTが属しているサーバーを取得
+                var guilds = _client.Guilds;    
+
+                foreach(var guild in guilds)
+                {
+                    //アイコンを要求してきたサーバーIDなら
+                    if(guild.Id == sendedGuildId)
                     {
-                        var reader = new StreamReader(fstream, Encoding.UTF8);
-                    
-                        while(!reader.EndOfStream)
-                        {
-                            var line = reader.ReadLine();
-                            sentData += $"{line},";
-                            if(i%2 == 1)
-                                sentData += $"{CurentMember.Contains(line)},";
-                            i++;
-                        }
+                        var memberDatas = GetMemberDatas(sendedGuildId);
+                        var guildsUser = guild.GetUsersAsync();
+                        await foreach (var users in guildsUser)
+                            //メンバーの情報をmemberDatasに代入
+                            foreach (var user in users)
+                            {
+                                var member = memberDatas.SetUserID(user.Id);
+                                member.avatarURL = user.GetDisplayAvatarUrl();
+                                member.memberName = user.DisplayName;
+                                if (member.date == null)
+                                    member.date = DateTime.MinValue;
+                                sentData += member.ToString();
+                            }
                     }
-                    sentData = sentData.TrimEnd(',');
-                    return sentData;
-                }else
+                }
+                sentData = sentData.TrimEnd(',');
+                return sentData;
+            }
+
+            private async Task UpdateMembers(string data)
+            {
+                foreach (var memberDatas in memberDatasList)
                 {
-                    var signals = data.Split(',');
-                    int oldMemberCount = MemberCount;
-                    using (StreamWriter sw = new StreamWriter("Log.txt", true, Encoding.GetEncoding("UTF-8")))
+                    //メンバーの入退出を更新
+                    var result = memberDatas.UpdateMemberActive(data);
+                    
+                    Console.WriteLine(result);
+
+                    //Logに描き込み
+                    using (StreamWriter sw = new StreamWriter($"Log_{memberDatas.discordServerID}.txt", true, Encoding.GetEncoding("UTF-8")))
                     {
-                        for (int i = 0; i < signals.Length / 3; i++)
-                        {
-                            
-                            if (signals[i * 3 + 2] == "IN")
-                            {
-                                MemberCount++;
-                                CurentMember.Add(signals[i * 3 + 1]);
-                            }
-                            if (signals[i * 3 + 2] == "OUT")
-                            {
-                                MemberCount--;
-                                CurentMember.Remove(signals[i * 3 + 1]);
-                            }
-                            sw.Write($"{signals[i * 3]},{signals[i * 3 + 1]},{signals[i * 3 + 2]}");
-                            Console.WriteLine($"{ signals[i * 3]} {signals[i * 3 + 1]} {signals[i * 3 + 2]}");
-                        }   
+                        sw.Write(result);
                     }
 
-                    await _client.SetGameAsync($"{memberCount}人が研究室", null, ActivityType.Competing);
-                        
+                    //ステータス欄に表示
+
+                    UpdateMember.SetData(memberDatas.activeMemberCount.ToString());
+                }
+                return;
+            }
+
+            private int oldmemberCount = 0;
+            private async Task<string> UpdateMemberDisplay(string data)
+            {
+                var memberCount = int.Parse(data);
+                await Task.Run(() =>
+                {
+                    _client.SetGameAsync($"{memberCount}人が研究室", null, ActivityType.Competing);
                     var chatchannel = _client.GetChannel(978806146452303896) as SocketTextChannel;
-                    if (oldMemberCount == 0 && MemberCount >= 1)
+                    if (oldmemberCount == 0 && memberCount >= 1)
                     {
-                        await _client.SetStatusAsync(UserStatus.Online);
-                        await chatchannel.SendMessageAsync($"{DateTime.Now.ToString("HH時mm分")} OPEN!!");
+                        _client.SetStatusAsync(UserStatus.Online);
+                        chatchannel.SendMessageAsync($"{DateTime.Now.ToString("HH時mm分")} OPEN!!");
                     }
-                    if (oldMemberCount >= 1  && MemberCount == 0)
+                    if (oldmemberCount >= 1 && memberCount == 0)
                     {
-                        await _client.SetStatusAsync(UserStatus.DoNotDisturb);
-                        await chatchannel.SendMessageAsync($"{DateTime.Now.ToString("HH時mm分")} CLOSE!!");
+                        _client.SetStatusAsync(UserStatus.DoNotDisturb);
+                        chatchannel.SendMessageAsync($"{DateTime.Now.ToString("HH時mm分")} CLOSE!!");
                     }
-                    return "ok";
+                    oldmemberCount = memberCount;
+                });
+                return null;
+            }
+
+            private MemberDatas GetMemberDatas(ulong discordServerId)
+            {
+                if (memberDatasList.Any(x => x.discordServerID == discordServerId))
+                    return memberDatasList.Where(x => x.discordServerID == discordServerId).ToList()[0];
+                else
+                {
+                    var memberData = new MemberDatas(discordServerId);
+                    memberDatasList.Add(memberData);
+                    return memberData;
                 }
             }
         };
@@ -167,6 +185,8 @@ namespace discordBOT_EntryExitManagement
         class ClientReceiveServer : BackgroundService
         {
             private readonly IConfiguration _configuration;
+            private string IPAdress = "192.168.1.3";
+            private int port = 12000;
 
             public ClientReceiveServer(IConfiguration configuration)
             {
@@ -178,9 +198,10 @@ namespace discordBOT_EntryExitManagement
                 TcpListener server = null;
                 try
                 {
-                    int port = 12000;
-                    IPAddress localAddr = IPAddress.Parse("172.17.23.238");
+                    IPAddress localAddr = IPAddress.Parse(IPAdress);
                     server = new TcpListener(localAddr, port);
+
+                    Console.WriteLine(localAddr);
 
                     server.Start();
 
@@ -208,8 +229,7 @@ namespace discordBOT_EntryExitManagement
                         
                         // Translate data bytes to a ASCII string.
 
-                        string s = "message from server-discord";
-                        s = await signalReceived(data);
+                        string s = await signalReceived(data);
                         Byte[] msg = System.Text.Encoding.UTF8.GetBytes(s);
                         stream.Write(msg, 0, msg.Length);
 
@@ -234,3 +254,53 @@ namespace discordBOT_EntryExitManagement
     }
 }
 
+class TimeOutExe
+{
+    private string datas = "";
+    private int initTime;
+    private int currentTime;
+    private bool currentStart = false;
+
+    public Func<string, Task> TimeoutedFunc;
+
+    public TimeOutExe(int initTime)
+    {
+        this.initTime = initTime;
+        currentTime = initTime;
+    }
+
+    public void AddData(string data)
+    {
+        datas += $"{data},";
+        UpdateTimeout(initTime);
+    }
+
+    public void SetData(string data)
+    {
+        datas = data;
+        UpdateTimeout(initTime);
+    }
+
+    public void UpdateTimeout(int newTime = 10)
+    {
+        if (!currentStart)
+        {
+            Task.Run(() => ExecuteTimeoutedFunc());
+            currentStart = true;
+        }
+        currentTime = newTime;
+    }
+
+    private async Task ExecuteTimeoutedFunc()
+    {
+        while (currentTime > 0)
+        {
+            await Task.Delay(1000);
+            currentTime--;
+        }
+        await TimeoutedFunc(datas);
+        currentStart = false;
+        currentTime = initTime;
+        datas = "";
+    }
+};
